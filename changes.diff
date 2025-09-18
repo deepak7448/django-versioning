@@ -1,0 +1,13 @@
+diff --git a/README.md b/README.md
+index e69de29..1edd7ef 100644
+--- a/README.md
++++ b/README.md
+@@ -0,0 +1,8 @@
++# Django Version Control
++
++A lightweight version control system for Django models without third-party packages.
++
++## Installation
++
++```bash
++pip install django-version-control
