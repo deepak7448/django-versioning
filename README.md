@@ -23,7 +23,7 @@ A lightweight **relational version control system** for Django models. It record
 Install the package and (optionally) django-crequest to allow automatic `request.user` detection, plus django-admin-rangefilter to filter history by date in admin:
 
 ```bash
-pip install django-version-control
+pip install django-versioning
 pip install django-crequest
 pip install django-admin-rangefilter
 ```
