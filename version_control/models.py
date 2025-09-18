@@ -5,12 +5,68 @@ from django.core.serializers.json import DjangoJSONEncoder
 from crequest.middleware import CrequestMiddleware
 from django.utils import timezone
 from django.conf import settings
+from version_control.managers import VersionControlManager, VersionedModelManager
 import hashlib, json
 
 User = get_user_model()
 
 class VersionControl(models.Model):
-    """Stores snapshots of model changes with hash and precomputed diff."""
+    """
+    Stores snapshots of changes for versioned models, providing
+    full audit history, rollback, and diff tracking.
+
+    Features:
+        - Tracks every change to versioned objects, including creation,
+          updates, deletions, restorations, and rollbacks.
+        - Stores full snapshot of object data along with a SHA-256 hash.
+        - Precomputes human-readable diffs for easy audit and comparison.
+        - Associates each version with the user who performed the action.
+
+    Fields:
+        content_type (ForeignKey to ContentType):
+            The type of the related object being versioned.
+
+        object_id (PositiveIntegerField):
+            The primary key of the related object.
+
+        version (PositiveIntegerField):
+            The version number of this snapshot.
+
+        data (JSONField):
+            Full snapshot of the object’s state at this version.
+
+        data_hash (CharField):
+            SHA-256 hash of the snapshot data for integrity checks.
+
+        action (CharField):
+            Action performed: "create", "update", "delete", "restore", or "rollback".
+
+        diff (JSONField, optional):
+            Precomputed human-readable diff between this version and the previous one.
+
+        created_at (DateTimeField):
+            Timestamp when this version was created.
+
+        user (ForeignKey to User, optional):
+            User who performed the action. Null if no user context is available.
+
+    Manager:
+        objects (VersionControlManager):
+            Custom manager to easily fetch latest version, history,
+            or a specific version.
+
+    Meta:
+        unique_together = ("content_type", "object_id", "version")
+
+    Example Usage:
+        >>> post = Post.objects.get(pk=1)
+        >>> VersionControl.objects.latest_version(post)
+        <VersionControl: Post v3 for 1>
+        >>> VersionControl.objects.history(post)
+        [<VersionControl v1>, <VersionControl v2>, <VersionControl v3>]
+        >>> VersionControl.objects.get_version(post, 2)
+        <VersionControl: Post v2 for 1>
+    """
     content_type = models.ForeignKey(ContentType,on_delete=models.SET_NULL,null=True,help_text="Content type of the application")
     object_id = models.PositiveIntegerField(null=True,help_text="Object ID of the application")
     version = models.PositiveIntegerField(help_text="Version number of the snapshot")
@@ -20,6 +76,8 @@ class VersionControl(models.Model):
     diff = models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder, help_text="Precomputed human-readable diff")  # precomputed human-readable diff
     created_at = models.DateTimeField(auto_now_add=True, help_text="Timestamp when the version was created")
     user = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, help_text="User who updated the version")
+    
+    objects = VersionControlManager()
 
     class Meta:
         unique_together = ("content_type", "object_id", "version")
@@ -30,11 +88,47 @@ class VersionControl(models.Model):
 
 class VersionedModel(models.Model):
     """
-    Base class with full relational versioning:
-    - Fields
-    - ForeignKey
-    - ManyToMany
+    Abstract base model providing full versioning and soft-delete support.
+
+    Features:
+        - Tracks the current version of the record.
+        - Supports soft deletion with timestamp and user tracking.
+        - Integrates with VersionControl for version snapshots.
+        - Works recursively with related VersionedModel objects (FKs and M2M).
+
+    Fields:
+        current_version (PositiveIntegerField):
+            The current version number of this record. Automatically incremented on changes.
+
+        is_deleted (BooleanField):
+            Indicates whether the record has been soft-deleted. Defaults to False.
+
+        deleted_at (DateTimeField):
+            Timestamp indicating when the record was soft-deleted. Null if not deleted.
+
+        deleted_by (ForeignKey to User):
+            References the user who deleted the record. Null if deleted programmatically
+            or if no user context is available.
+
+    Manager:
+        objects (VersionedModelManager):
+            Custom manager that by default excludes soft-deleted objects,
+            and provides helper methods for restoring and accessing deleted records.
+
+    Usage:
+        >>> post = Post.objects.create(title="Hello")
+        >>> post.delete(user=request.user)
+        >>> Post.objects.all()  # Excludes deleted records
+        >>> Post.objects.deleted()  # Only soft-deleted records
+        >>> Post.objects.restore(pk=post.pk, user=request.user)  # Restore soft-deleted record
+
+    Notes:
+        - This is an abstract model. Inherit from this class to enable versioning
+          and soft-delete functionality for your models.
+        - Version snapshots are automatically created whenever the record is saved,
+          deleted, restored, or rolled back.
     """
+
     current_version = models.PositiveIntegerField(default=1, editable=False, help_text="Current version number of the record")
     is_deleted = models.BooleanField(default=False, editable=False, help_text="Indicates if the record is deleted")
     deleted_at = models.DateTimeField(null=True, blank=True, editable=False, help_text="Timestamp when the record was deleted")
@@ -43,6 +137,7 @@ class VersionedModel(models.Model):
         on_delete=models.SET_NULL, related_name="deleted_%(class)s_set", editable=False, help_text="User who deleted the record"
     )
 
+    objects = VersionedModelManager()
 
     class Meta:
         abstract = True
@@ -51,9 +146,20 @@ class VersionedModel(models.Model):
     # Helpers
     # ----------------------------
     def _serialize_fields(self):
+        """
+        Serialize all fields of the model, excluding id, current_version, is_deleted, deleted_at, and deleted_by.
+
+        ForeignKey and FileField values are serialized as their pk and name, respectively.
+        ManyToManyField values are serialized as a list of their related objects' ids.
+
+        Returns:
+            dict: A dictionary containing serialized values of all fields.
+        """
         data = {}
+        skip_fields = {"id", "current_version", "is_deleted", "deleted_at", "deleted_by"}
+
         for field in self._meta.fields:
-            if field.name in ["id", "current_version", "is_deleted", "deleted_at", "deleted_by"]:
+            if field.name in skip_fields:
                 continue
             value = getattr(self, field.name)
             if isinstance(field, models.ForeignKey):
@@ -64,65 +170,86 @@ class VersionedModel(models.Model):
                 data[field.name] = value
 
         for field in self._meta.many_to_many:
-            related_ids = list(getattr(self, field.name).values_list("id", flat=True))
-            data[field.name] = related_ids
+            data[field.name] = list(getattr(self, field.name).values_list("id", flat=True))
+
         return data
-    
-    def _compute_hash(self, data: dict) -> str:
+
+    @staticmethod
+    def _compute_hash(data: dict) -> str:
+        """
+        Compute the SHA-256 hash of a given dictionary.
+
+        Args:
+            data (dict): Dictionary to compute the hash for.
+
+        Returns:
+            str: The computed hash as a hexadecimal string.
+        """
         normalized = json.dumps(data, sort_keys=True, default=str)
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-    def save_version(self, user=None, tombstone=False,action='update'):
-        """Save snapshot of self + related VersionedModel objects with hash + diff."""
-        # from versioning.models import VersionControl
+    def _get_last_version(self):
+        """
+        Return the latest version entry for this object, or None if no versions are found.
 
-        # ---------- 1️⃣ Save related FK/M2M objects ----------
+        Args:
+            None
+
+        Returns:
+            Optional[VersionControl]: The latest version entry for this object, or None if no versions are found.
+        """
+        content_type = ContentType.objects.get_for_model(self.__class__)
+        return VersionControl.objects.filter(content_type=content_type, object_id=self.pk).order_by("-version").first()
+
+    # ----------------------------
+    # Versioning
+    # ----------------------------
+    def save_version(self, user=None, tombstone=False, action="update"):
+        # Save related FK/M2M objects
+        """
+        Save a version snapshot of this object, including related FK/M2M objects.
+
+        Args:
+            user: Optional[User]: The user who triggered the save. If None, will attempt to resolve from the active request.
+            tombstone: bool: If True, will save a "tombstone" version with a deleted marker.
+            action: str: The action to store in the version history (create, update, delete, restore, rollback).
+
+        Returns:
+            None
+        """
         for field in self._meta.fields:
             if isinstance(field, models.ForeignKey):
                 obj = getattr(self, field.name)
-                if obj and isinstance(obj, VersionedModel):
+                if isinstance(obj, VersionedModel):
                     obj.save_version(user=user)
-
         for field in self._meta.many_to_many:
             for obj in getattr(self, field.name).all():
                 if isinstance(obj, VersionedModel):
                     obj.save_version(user=user)
-    
-        content_type = ContentType.objects.get_for_model(self.__class__)
-        last = VersionControl.objects.filter(
-            content_type=content_type,
-            object_id=self.pk
-        ).order_by("-version").first()
-        if not last:  # first save = create
-            action = "create"
-        # ---------- 2️⃣ Prepare snapshot ----------
+
+        last = self._get_last_version()
+        action = "create" if not last else action
+
         if tombstone:
             snapshot = {"__deleted__": True}
-            diff = {"__deleted__": True}
             action = "delete"
             data_hash = self._compute_hash(snapshot)
         else:
             snapshot = self._serialize_fields()
             if self.is_deleted:
                 snapshot["__deleted__"] = True
-
-
             data_hash = self._compute_hash(snapshot)
-
-            # Skip if no changes
             if last and last.data_hash == data_hash and action not in ("delete", "restore", "rollback"):
                 return
 
-        # ---------- 3️⃣ Human-readable diff ----------
-        
-        
+        # Compute human-readable diff
         last_data = last.data if last else {}
-        diff = {}
-        for k, v in snapshot.items():
-            if last_data.get(k) != v:
-                diff[k] = {"old": last_data.get(k), "new": v}
+        diff = {
+            k: {"old": last_data.get(k), "new": v}
+            for k, v in snapshot.items() if last_data.get(k) != v
+        }
 
-        # ---------- 4️⃣ Save VersionControl ----------
+        # Save VersionControl entry
         version_number = (last.version + 1) if last else 1
         content_type = ContentType.objects.get_for_model(self.__class__)
         VersionControl.objects.create(
@@ -133,21 +260,50 @@ class VersionedModel(models.Model):
             data_hash=data_hash,
             action=action,
             diff=None,
-            user=user if user else (CrequestMiddleware.get_request().user if CrequestMiddleware.get_request() and CrequestMiddleware.get_request().user.is_authenticated else None)
+            user=user or self._get_request_user()
         )
 
         # Update current_version
         self.current_version = version_number
-        super(VersionedModel, self).save(update_fields=["current_version"])
+        super().save(update_fields=["current_version"])
+
+    @staticmethod
+    def _get_request_user():
+        """
+        Returns the current user if the request is authenticated and a user is available, otherwise None.
+
+        :return: Optional[User]
+        """
+        request = CrequestMiddleware.get_request()
+        if request and hasattr(request, "user") and request.user.is_authenticated:
+            return request.user
+        return None
+
     # ----------------------------
     # Lifecycle methods
     # ----------------------------
     def save(self, *args, user=None, **kwargs):
+        """
+        Save a record and automatically create a version control snapshot with action "create" or "update".
+
+        Args:
+            user (User, optional): User who initiated the save. Defaults to None.
+
+        """
         super().save(*args, **kwargs)
         self.save_version(user=user)
 
-
     def delete(self, user=None, hard=False, *args, **kwargs):
+        """
+        Delete a record.
+
+        If `hard=True`, the record is deleted without leaving a tombstone.
+        Otherwise, the record is marked as deleted and a version control snapshot is saved with action "delete".
+
+        :param user: User who initiated the delete
+        :param hard: If True, delete the record without leaving a tombstone (default: False)
+        :return: None
+        """
         if hard:
             self.current_version += 1
             self.save_version(user=user, tombstone=True)
@@ -161,22 +317,39 @@ class VersionedModel(models.Model):
         self.save_version(user=user, tombstone=True, action="delete")
 
     def restore(self, user=None, *args, **kwargs):
+        """
+        Restore a deleted record.
+
+        If the record is not deleted, do nothing.
+
+        After restoring, save the record with an incremented version number
+        and save a version control snapshot with action "restore".
+
+        :param user: User who initiated the restore
+        :return: None
+        """
         if not self.is_deleted:
             return
         self.is_deleted = False
         self.deleted_at = None
         self.deleted_by = None
-        self.current_version += 1        
+        self.current_version += 1
         super().save(*args, **kwargs)
-        self.save_version(user=user,action="restore")
+        self.save_version(user=user, action="restore")
 
     # ----------------------------
-    # Rollback with related objects
+    # Rollback
     # ----------------------------
     def rollback(self, version_number, user=None, *args, **kwargs):
-        content_type = ContentType.objects.get_for_model(self.__class__)
+        """
+        Rollback a record to a specific version.
+
+        :param version_number: int version to rollback to
+        :param user: User who initiated the rollback
+        :raises ValueError: if the version is not found
+        """
         snapshot = VersionControl.objects.filter(
-            content_type=content_type,
+            content_type=ContentType.objects.get_for_model(self.__class__),
             object_id=self.pk,
             version=version_number
         ).first()
@@ -189,70 +362,120 @@ class VersionedModel(models.Model):
             self.deleted_at = timezone.now()
         else:
             for field in self._meta.fields:
-                if field.name in ["id", "current_version", "is_deleted", "deleted_at", "deleted_by"]:
-                    continue
-        self.current_version = version_number
+                if field.name not in {"id", "current_version", "is_deleted", "deleted_at", "deleted_by"}:
+                    setattr(self, field.name, data.get(field.name))
         self.is_deleted = False
         self.deleted_at = None
         self.deleted_by = None
+
+        self.current_version = version_number
         super().save(*args, **kwargs)
         self.save_version(user=user, action="rollback")
 
     # ----------------------------
-    # Diff including related objects
+    # Diff between versions
     # ----------------------------
     def diff_versions(self, v1, v2):
-        content_type = ContentType.objects.get_for_model(self.__class__)
-        snap1 = VersionControl.objects.filter(
-            content_type=content_type, object_id=self.pk, version=v1
-        ).first()
-        snap2 = VersionControl.objects.filter(
-            content_type=content_type, object_id=self.pk, version=v2
-        ).first()
-        if not snap1 or not snap2:
-            raise ValueError("One or both versions not found")
+        """
+        Compute the diff between two versions of self.
 
+        Args:
+            v1 (int): The version number of the first snapshot.
+            v2 (int): The version number of the second snapshot.
+
+        Returns:
+            dict: A dictionary with the following format:
+                {
+                    "field_name": {
+                        "from": old_val,
+                        "to": new_val
+                    }
+                }
+
+        Raises:
+            ValueError: If either version is not found for self.
+        """
+        content_type = ContentType.objects.get_for_model(self.__class__)
+        
+        snap1 = VersionControl.objects.filter(
+            content_type=content_type,
+            object_id=self.pk,
+            version=v1
+        ).first()
+        
+        snap2 = VersionControl.objects.filter(
+            content_type=content_type,
+            object_id=self.pk,
+            version=v2
+        ).first()
+        
+        if not snap1 or not snap2:
+            missing_versions = []
+            if not snap1:
+                missing_versions.append(v1)
+            if not snap2:
+                missing_versions.append(v2)
+            raise ValueError(
+                f"Version(s) {missing_versions} not found for "
+                f"{self.__class__.__name__} with ID {self.pk}"
+            )
+        
         changes = {}
-        for key in set(snap1.data.keys()).union(set(snap2.data.keys())):
+        for key in snap1.data.keys() | snap2.data.keys():
             old_val, new_val = snap1.data.get(key), snap2.data.get(key)
-            if isinstance(old_val, list) and isinstance(new_val, list):
-                # M2M diff
-                added = list(set(new_val) - set(old_val))
-                removed = list(set(old_val) - set(new_val))
-                if added or removed:
-                    changes[key] = {"added": added, "removed": removed}
-            elif old_val != new_val:
-                changes[key] = {"from": old_val, "to": new_val}
+            if old_val != new_val:
+                if isinstance(old_val, list) and isinstance(new_val, list):
+                    added = list(set(new_val) - set(old_val))
+                    removed = list(set(old_val) - set(new_val))
+                    if added or removed:
+                        changes[key] = {"added": added, "removed": removed}
+                else:
+                    changes[key] = {"from": old_val, "to": new_val}
+        
         return changes
 
 
+    # ----------------------------
+    # Audit trail
+    # ----------------------------
     def audit_trail(self):
-        content_type = ContentType.objects.get_for_model(self.__class__)
-        history = VersionControl.objects.filter(
-            content_type=content_type,
+        """
+        Generate a human-readable audit trail for this object.
+
+        Returns a list of dictionaries, each representing a version of the object.
+        Each dictionary contains the following keys:
+            - version (int): The version number of the snapshot.
+            - changed_by (str): The username of the user who performed the action.
+            - changed_at (datetime): The timestamp when the version was created.
+            - changes (dict): A dictionary containing the changed fields and their old and new values.
+        """
+        versions = VersionControl.objects.filter(
+            content_type=ContentType.objects.get_for_model(self.__class__),
             object_id=self.pk
-        ).order_by("version")
+        ).order_by("version").values("version", "user__username", "created_at", "data")
+
         report = []
         previous_data = None
-        for vc in history:
-            if previous_data is not None:
+        for v in versions:
+            if previous_data:
                 changes = {}
-                for key in set(previous_data.keys()).union(vc.data.keys()):
-                    old_val = previous_data.get(key)
-                    new_val = vc.data.get(key)
-                    if isinstance(old_val, list) and isinstance(new_val, list):
-                        added = list(set(new_val) - set(old_val))
-                        removed = list(set(old_val) - set(new_val))
-                        if added or removed:
-                            changes[key] = {"added": added, "removed": removed}
-                    elif old_val != new_val:
-                        changes[key] = {"from": old_val, "to": new_val}
+                for key in previous_data.keys() | v["data"].keys():
+                    old_val, new_val = previous_data.get(key), v["data"].get(key)
+                    if old_val != new_val:
+                        if isinstance(old_val, list) and isinstance(new_val, list):
+                            added = list(set(new_val) - set(old_val))
+                            removed = list(set(old_val) - set(new_val))
+                            if added or removed:
+                                changes[key] = {"added": added, "removed": removed}
+                        else:
+                            changes[key] = {"from": old_val, "to": new_val}
                 if changes:
                     report.append({
-                        "version": vc.version,
-                        "changed_by": vc.user.username if vc.user else None,
-                        "changed_at": vc.created_at,
+                        "version": v["version"],
+                        "changed_by": v["user__username"],
+                        "changed_at": v["created_at"],
                         "changes": changes
                     })
-            previous_data = vc.data
+            previous_data = v["data"]
+
         return report
