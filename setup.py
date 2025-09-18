@@ -5,4 +5,6 @@ from setuptools import setup
 with open(os.path.join(os.path.dirname(__file__), "README.md")) as readme_file:
     long_description = readme_file.read()
 
-setup()
+setup(
+    long_description=long_description,
+)

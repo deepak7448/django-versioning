@@ -67,3 +67,6 @@ Network Trash Folder
 Temporary Items
 .apdisk
 venv/
+changes.diff/
+django_versioning.egg-info/
+dist/
