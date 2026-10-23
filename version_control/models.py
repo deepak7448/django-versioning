@@ -241,6 +241,17 @@ class VersionedModel(models.Model):
     def _db_alias(self, using=None):
         return using or router.db_for_write(self.__class__, instance=self)
 
+    @classmethod
+    def _lock_rows(cls, pks, using=None):
+        """
+        SELECT ... FOR UPDATE the given rows, in primary key order so concurrent
+        lockers can't deadlock each other. Must run inside a transaction.
+        """
+        queryset = cls._base_manager.select_for_update().filter(pk__in=list(pks)).order_by("pk")
+        if using:
+            queryset = queryset.using(using)
+        list(queryset.values_list("pk", flat=True))
+
     def _get_last_version(self):
         """
         Return the latest version entry for this object, or None if no versions are found.
@@ -341,7 +352,7 @@ class VersionedModel(models.Model):
                 # Lock the row so concurrent writers can't both claim the same version number.
                 # Then re-read the latest version and re-take the snapshot: writers that held
                 # the lock before us have committed, and the snapshot must include their changes.
-                self.__class__._base_manager.select_for_update().filter(pk=self.pk).values_list("pk").first()
+                self._lock_rows([self.pk], using=self._db_alias())
                 last = self._get_last_version()
                 snapshot, data_hash = take_snapshot()
                 if unchanged(last, data_hash):

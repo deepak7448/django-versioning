@@ -163,15 +163,22 @@ class QueryCountTests(TestCase):
         with self.assertNumQueries(8):
             self.post.save()
 
-    def test_m2m_change_locks_before_writing(self):
+    def test_m2m_change_locks_row_before_touching_through_table(self):
+        # Inserting the through row takes a shared lock on the post row for the FK check (InnoDB);
+        # taking our exclusive lock only after that lets concurrent writers deadlock.
         tag = Tag.objects.create(name="t")
+        qn = connection.ops.quote_name
+        lock_sql = f"FROM {qn('testapp_post')} WHERE {qn('testapp_post')}.{qn('id')}"
+        insert_sql = f"INTO {qn('testapp_post_tags')}"
+
         with CaptureQueriesContext(connection) as ctx:
             self.post.tags.add(tag)
 
+        sqls = [q["sql"] for q in ctx]
+        lock_at = next(i for i, sql in enumerate(sqls) if sql.startswith("SELECT") and lock_sql in sql)
+        insert_at = next(i for i, sql in enumerate(sqls) if sql.startswith("INSERT") and insert_sql in sql)
+        self.assertLess(lock_at, insert_at)
         self.assertEqual(VersionControl.objects.latest_version(self.post).data["tags"], [tag.pk])
-        # SQLite ignores FOR UPDATE, so look for the lock SELECT followed by a re-read of the last version
-        selects = [q["sql"] for q in ctx if q["sql"].startswith("SELECT")]
-        self.assertTrue(any('FROM "testapp_post" WHERE "testapp_post"."id"' in sql for sql in selects))
 
 
 class ContentObjectTests(TestCase):
