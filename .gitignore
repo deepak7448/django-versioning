@@ -67,6 +67,14 @@ Network Trash Folder
 Temporary Items
 .apdisk
 venv/
-changes.diff/
-django_versioning.egg-info/
+changes.diff
+*.egg-info/
 dist/
+build/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Example project database
+examples/db.sqlite3

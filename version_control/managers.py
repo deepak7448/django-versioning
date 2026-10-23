@@ -1,6 +1,29 @@
-from django.db import models
+from contextlib import contextmanager
+from contextvars import ContextVar
+from django.db import models, transaction
 from django.contrib.contenttypes.models import ContentType
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
+
+# When set, VersionedModelManager stops hiding soft-deleted rows (used during unique validation).
+# A ContextVar keeps this per thread / per async task.
+_include_deleted = ContextVar("version_control_include_deleted", default=False)
+
+
+@contextmanager
+def include_deleted():
+    """
+    Make VersionedModelManager querysets include soft-deleted rows inside this block.
+
+    Example:
+        >>> with include_deleted():
+        ...     Post.objects.filter(title="dup").exists()  # also sees soft-deleted posts
+    """
+    token = _include_deleted.set(True)
+    try:
+        yield
+    finally:
+        _include_deleted.reset(token)
+
 
 class VersionControlManager(models.Manager):
     """
@@ -77,7 +100,48 @@ class VersionControlManager(models.Manager):
         ).first()
 
 
-class VersionedModelManager(models.Manager):
+class VersionedQuerySet(models.QuerySet):
+    """
+    QuerySet for VersionedModel whose bulk delete goes through the model's
+    delete(), so soft deletion and tombstone versions apply to bulk operations
+    (including the admin's "delete selected" action).
+    """
+
+    def delete(self, user: Optional[models.Model] = None):
+        """
+        Soft-delete every non-deleted object in the queryset, recording a delete version for each.
+
+        Returns:
+            tuple: (count, {model_label: count}), matching QuerySet.delete().
+        """
+        count = 0
+        with transaction.atomic(using=self.db):
+            for obj in self.filter(is_deleted=False):
+                obj.delete(user=user)
+                count += 1
+        return count, {self.model._meta.label: count}
+
+    # Keep from_queryset() from copying this onto the manager (Model.objects.delete() would wipe the table)
+    delete.queryset_only = True
+
+    def hard_delete(self, user: Optional[models.Model] = None):
+        """
+        Permanently delete every object in the queryset, recording a tombstone version for each.
+
+        Returns:
+            tuple: (count, {model_label: count}), matching QuerySet.delete().
+        """
+        count = 0
+        with transaction.atomic(using=self.db):
+            for obj in self:
+                obj.delete(user=user, hard=True)
+                count += 1
+        return count, {self.model._meta.label: count}
+
+    hard_delete.queryset_only = True
+
+
+class VersionedModelManager(models.Manager.from_queryset(VersionedQuerySet)):
     """
     Manager for VersionedModel with built-in soft-delete handling.
 
@@ -96,19 +160,21 @@ class VersionedModelManager(models.Manager):
         restore(pk, user=None):
             Restore a soft-deleted object by primary key.
 
-        get_or_restore(pk, user=None):
-            Fetch object by PK, restoring it if it was deleted.
+    Querysets also provide delete() (soft delete) and hard_delete(); see VersionedQuerySet.
     """
 
     def get_queryset(self) -> models.QuerySet:
         """
-        Return only non-deleted records.
+        Return only non-deleted records (all records inside an include_deleted() block).
 
         Example:
             >>> Post.objects.get_queryset()
             [<Post: Post v1 for 1>, <Post: Post v2 for 1>]
         """
-        return super().get_queryset().filter(is_deleted=False)
+        queryset = super().get_queryset()
+        if _include_deleted.get():
+            return queryset
+        return queryset.filter(is_deleted=False)
 
     def all_with_deleted(self) -> models.QuerySet:
         """
