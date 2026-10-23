@@ -1,3 +1,7 @@
 include README.md
 include LICENSE
-recursive-include versioning/migrations *.py
+include CHANGELOG.md
+include runtests.py
+recursive-include version_control/migrations *.py
+recursive-include tests *.py
+prune examples
