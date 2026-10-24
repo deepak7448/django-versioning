@@ -524,20 +524,6 @@ cd examples && ../venv/bin/python manage.py test blog   # example project tests
 
 To run the package tests against another database, set `DB_ENGINE` and the connection variables (`DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT`). The concurrency tests only run on databases with row locks, such as PostgreSQL and MySQL:
 
-```bash
-pip install "psycopg[binary]"
-DB_ENGINE=django.db.backends.postgresql DB_NAME=postgres DB_USER=postgres DB_HOST=localhost venv/bin/python runtests.py
-```
-
-GitHub Actions (`.github/workflows/django.yml`) builds the package once, then installs that wheel and runs both test suites across the Python/Django matrix, and the package tests on PostgreSQL and MySQL.
-
-Build and check a release:
-
-```bash
-venv/bin/python -m build
-venv/bin/twine check dist/*
-```
-
 ## License
 
 MIT. See [LICENSE](https://github.com/deepak7448/django-versioning/blob/master/LICENSE).
